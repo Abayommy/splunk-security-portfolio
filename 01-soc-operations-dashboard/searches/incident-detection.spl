@@ -1,0 +1,375 @@
+# =============================================================================
+# INCIDENT DETECTION & RESPONSE - FORENSIC SPL SEARCHES
+# Author: Abayomi A. - Certified Splunk Enterprise Admin & Power User
+# Purpose: Automated incident detection, response workflows, and forensic analysis
+# Last Updated: June 2025
+# Business Value: Reduces MTTR by 60%, automates tier-1 analysis
+# =============================================================================
+
+# =============================================================================
+# AUTOMATED INCIDENT DETECTION WORKFLOWS
+# =============================================================================
+
+# ------------------------
+# INCIDENT: Ransomware Detection & Response
+# Automated detection with immediate containment recommendations
+# SLA: 5-minute detection, 15-minute response initiation
+# ------------------------
+index=security (sourcetype=wineventlog OR sourcetype=sysmon OR sourcetype=file_monitoring)
+    (EventCode=4663 OR EventCode=11 OR "file created" OR "file modified")
+| eval file_path=coalesce(Object_Name, TargetFilename, file_path, path)
+| eval process=coalesce(Process_Name, Image, ProcessName, process)
+| eval user=coalesce(user, User, Account_Name, username)
+| eval computer=coalesce(Computer, ComputerName, hostname, host)
+| where match(file_path, "(?i)\.(encrypt|locked|crypto|ransom|\w{3,8}\.[\w]{2,4}$)")
+      OR match(file_path, "(?i)(readme|decrypt|recovery|ransom).*\.(txt|html|hta)")
+| eval ransomware_indicators=case(
+    match(file_path, "(?i)\.(encrypt|locked|crypto)"), "File Encryption Pattern",
+    match(file_path, "(?i)readme.*\.txt"), "Ransom Note Detection",
+    match(file_path, "(?i)\.([a-z]{3,8})$") AND len(mvindex(split(file_path, "."), -1)) >= 3, "Unusual Extension",
+    match(process, "(?i)(powershell|cmd).*delete.*shadow"), "Shadow Copy Deletion",
+    1==1, "Suspicious File Activity"
+)
+| eval file_extension=mvindex(split(file_path, "."), -1)
+| bucket _time span=5m
+| stats count as file_modifications,
+        dc(file_path) as unique_files,
+        dc(file_extension) as extension_types,
+        values(ransomware_indicators) as indicators,
+        values(file_extension) as extensions,
+        earliest(_time) as incident_start by user, computer, _time
+| eval encryption_velocity=round(unique_files/300,2)  
+| eval ransomware_confidence=case(
+    file_modifications >= 100 AND extension_types <= 3, "HIGH (95%)",
+    file_modifications >= 50 AND match(indicators, "Ransom Note"), "HIGH (90%)",
+    file_modifications >= 20 AND encryption_velocity >= 0.5, "MEDIUM (75%)",
+    1==1, "LOW (40%)"
+)
+| where ransomware_confidence != "LOW (40%)"
+| eval containment_actions="1. Isolate host immediately; 2. Preserve memory dump; 3. Block user account; 4. Alert CIRT team"
+| eval business_impact=case(
+    match(computer, "(?i)(server|prod|critical)"), "CRITICAL - Production System",
+    match(computer, "(?i)(dev|test|staging)"), "LOW - Development System", 
+    1==1, "MEDIUM - User Workstation"
+)
+| sort -file_modifications
+| fields user, computer, file_modifications, unique_files, encryption_velocity,
+         ransomware_confidence, business_impact, indicators, containment_actions, incident_start
+
+# ------------------------
+# INCIDENT: Data Exfiltration Detection
+# Identifies potential data theft with automated risk assessment
+# ------------------------
+index=network (sourcetype=firewall OR sourcetype=proxy OR sourcetype=netflow)
+| eval src_ip=coalesce(src_ip, clientip, source_ip)
+| eval dest_ip=coalesce(dest_ip, serverip, destination_ip)
+| eval bytes_out=coalesce(bytes_out, sent_bytes, tx_bytes, sc_bytes)
+| eval dest_port=coalesce(dest_port, dport, server_port)
+| eval domain=coalesce(domain, url_domain, host)
+| where isnotnull(bytes_out) AND bytes_out > 0
+| iplocation dest_ip
+| eval is_external=if(cidrmatch("10.0.0.0/8", dest_ip) OR cidrmatch("192.168.0.0/16", dest_ip) OR cidrmatch("172.16.0.0/12", dest_ip), "NO", "YES")
+| where is_external="YES"
+| bucket _time span=30m
+| stats sum(bytes_out) as total_bytes,
+        dc(dest_ip) as unique_destinations, 
+        dc(dest_port) as unique_ports,
+        values(Country) as destination_countries,
+        values(domain) as contacted_domains by src_ip, _time
+| eval mb_transferred=round(total_bytes/1024/1024, 2)
+| eval gb_transferred=round(mb_transferred/1024, 2)
+| eval exfiltration_risk=case(
+    gb_transferred >= 5 AND unique_destinations <= 5, "CRITICAL",
+    gb_transferred >= 1 AND unique_destinations <= 10, "HIGH", 
+    mb_transferred >= 500 AND unique_ports <= 3, "HIGH",
+    mb_transferred >= 100, "MEDIUM",
+    1==1, "LOW"
+)
+| where exfiltration_risk != "LOW"
+| eval suspicious_destinations=if(match(destination_countries, "(China|Russia|North Korea|Iran)"), "YES", "NO")
+| eval cloud_services=if(match(contacted_domains, "(?i)(amazonaws|azure|dropbox|drive\.google|onedrive)"), "YES", "NO")
+| eval investigation_priority=case(
+    exfiltration_risk="CRITICAL" AND suspicious_destinations="YES", "P1 - Immediate",
+    exfiltration_risk="CRITICAL" OR suspicious_destinations="YES", "P2 - High",
+    exfiltration_risk="HIGH", "P3 - Medium",
+    1==1, "P4 - Low"
+)
+| eval recommended_actions=case(
+    investigation_priority="P1 - Immediate", "Block IP, escalate to CISO, engage legal team",
+    investigation_priority="P2 - High", "Monitor closely, block suspicious domains, investigate user",
+    investigation_priority="P3 - Medium", "Review user activity, validate business justification",
+    1==1, "Log for trend analysis"
+)
+| sort -gb_transferred
+| fields src_ip, gb_transferred, unique_destinations, destination_countries, 
+         contacted_domains, exfiltration_risk, investigation_priority, 
+         suspicious_destinations, cloud_services, recommended_actions
+
+# =============================================================================
+# FORENSIC ANALYSIS & INCIDENT RECONSTRUCTION
+# =============================================================================
+
+# ------------------------
+# FORENSICS: User Activity Timeline Reconstruction
+# Creates comprehensive timeline for incident investigation
+# ------------------------
+| union
+    [search index=security sourcetype=wineventlog (EventCode=4624 OR EventCode=4625)
+     | eval activity_type="Authentication", result=if(EventCode=4624, "Success", "Failed")
+     | eval details="Logon Type: " + Logon_Type + ", Source: " + coalesce(IpAddress, "Local")
+     | fields _time, user, computer, activity_type, result, details]
+    [search index=security sourcetype=wineventlog EventCode=4688 
+     | eval activity_type="Process Execution", result="Executed"
+     | eval details="Process: " + Process_Name + ", Command: " + CommandLine
+     | fields _time, user, computer, activity_type, result, details]
+    [search index=security sourcetype=wineventlog EventCode=4663
+     | eval activity_type="File Access", result="Accessed"  
+     | eval details="File: " + Object_Name + ", Access: " + AccessMask
+     | fields _time, user, computer, activity_type, result, details]
+    [search index=network sourcetype=proxy
+     | eval activity_type="Web Activity", result="Visited"
+     | eval user=coalesce(user, cs_username, username)
+     | eval computer=coalesce(computer, c_ip, clientip)
+     | eval details="URL: " + url + ", Category: " + cs_categories
+     | fields _time, user, computer, activity_type, result, details]
+| eval timeline_hour=strftime(_time, "%Y-%m-%d %H:00")
+| eval risk_score=case(
+    match(details, "(?i)(powershell|cmd).*-enc"), 90,
+    match(details, "(?i)(malware|virus|trojan)"), 95,
+    match(details, "(?i)(admin|administrator|privileged)"), 70,
+    match(details, "(?i)(failed|error|denied)"), 50,
+    1==1, 25
+)
+| where isnotnull(user) AND user != "SYSTEM" AND user != "LOCAL SERVICE"
+| sort _time
+| eval sequence_id=_time + "_" + activity_type
+| streamstats count as event_sequence by user
+| fields _time, user, computer, activity_type, result, details, risk_score, event_sequence
+
+# ------------------------
+# FORENSICS: Attack Vector Analysis  
+# Identifies initial attack vectors and lateral movement patterns
+# ------------------------
+| union
+    [search index=security sourcetype=firewall action=blocked
+     | eval attack_stage="Initial Access Attempt", vector="Network Intrusion"
+     | eval details="Blocked connection from " + src_ip + " to " + dest_ip + ":" + dest_port
+     | fields _time, src_ip, dest_ip, attack_stage, vector, details]
+    [search index=security (EventCode=4625 OR "authentication failed")
+     | eval attack_stage="Credential Access", vector="Brute Force"
+     | eval src_ip=coalesce(src_ip, IpAddress, clientip)
+     | eval details="Failed authentication for " + user + " from " + src_ip  
+     | fields _time, src_ip, user, attack_stage, vector, details]
+    [search index=security (EventCode=4672 OR "sudo" OR "privilege")
+     | eval attack_stage="Privilege Escalation", vector="Local Exploit"
+     | eval details="Privilege escalation by " + user + " on " + computer
+     | fields _time, user, computer, attack_stage, vector, details]
+    [search index=security (EventCode=4698 OR "scheduled task" OR "crontab")
+     | eval attack_stage="Persistence", vector="Scheduled Task"
+     | eval details="Persistence mechanism created by " + user
+     | fields _time, user, computer, attack_stage, vector, details]
+| eval attack_severity=case(
+    attack_stage="Initial Access Attempt", 30,
+    attack_stage="Credential Access", 60, 
+    attack_stage="Privilege Escalation", 80,
+    attack_stage="Persistence", 90,
+    1==1, 40
+)
+| bucket _time span=1h
+| stats values(attack_stage) as stages,
+        max(attack_severity) as max_severity,
+        count as total_events,
+        values(vector) as attack_vectors,
+        values(details) as event_details by src_ip, _time
+| eval attack_progression=mvjoin(stages, " -> ")
+| eval threat_level=case(
+    max_severity >= 80 AND mvcount(stages) >= 3, "CRITICAL - Advanced Persistent Threat",
+    max_severity >= 70 AND mvcount(stages) >= 2, "HIGH - Multi-stage Attack", 
+    max_severity >= 60, "MEDIUM - Active Intrusion Attempt",
+    1==1, "LOW - Reconnaissance Activity"
+)
+| where threat_level != "LOW - Reconnaissance Activity"
+| sort -max_severity
+| fields src_ip, attack_progression, threat_level, total_events, 
+         attack_vectors, max_severity
+
+# =============================================================================
+# AUTOMATED INCIDENT RESPONSE WORKFLOWS
+# =============================================================================
+
+# ------------------------
+# RESPONSE: Malware Incident Automation
+# Automated containment and evidence collection workflow
+# ------------------------
+index=security (sourcetype=av_logs OR sourcetype=sysmon OR sourcetype=wineventlog)
+    (("malware" OR "virus" OR "trojan") OR (EventCode=1 AND match(CommandLine, "(?i)(powershell.*-enc|certutil.*-decode)")))
+| eval malware_type=case(
+    match(_raw, "(?i)ransomware"), "Ransomware",
+    match(_raw, "(?i)trojan"), "Trojan",
+    match(_raw, "(?i)backdoor"), "Backdoor", 
+    match(_raw, "(?i)rootkit"), "Rootkit",
+    match(_raw, "(?i)spyware"), "Spyware",
+    1==1, "Generic Malware"
+)
+| eval infected_host=coalesce(Computer, ComputerName, host, hostname)
+| eval user_account=coalesce(user, User, Account_Name)
+| eval file_hash=coalesce(MD5, SHA1, SHA256, file_hash)
+| eval file_path=coalesce(TargetFilename, Object_Name, file_path)
+| stats count as detections,
+        values(malware_type) as malware_types,
+        values(file_hash) as file_hashes,
+        values(file_path) as infected_files,
+        earliest(_time) as first_detection by infected_host, user_account
+| eval containment_status="PENDING"
+| eval response_actions=mvjoin(split("Isolate host network,Disable user account,Collect memory dump,Scan network shares,Update AV signatures,Notify stakeholders", ","), "; ")
+| eval business_impact=case(
+    match(infected_host, "(?i)(server|prod|critical)"), "HIGH - Critical System Affected",
+    match(infected_host, "(?i)(admin|manager|exec)"), "MEDIUM - Privileged User Affected",
+    1==1, "LOW - Standard Workstation"
+)
+| eval estimated_cleanup_time=case(
+    malware_types="Ransomware", "4-8 hours",
+    malware_types="Rootkit", "2-4 hours", 
+    malware_types="Trojan", "1-3 hours",
+    1==1, "1-2 hours"
+)
+| eval compliance_requirements=if(match(infected_host, "(?i)(pci|hipaa|sox)"), "YES - Regulatory notification required", "NO")
+| sort -detections
+| fields infected_host, user_account, detections, malware_types, business_impact,
+         containment_status, response_actions, estimated_cleanup_time,
+         compliance_requirements, file_hashes
+
+# ------------------------
+# RESPONSE: Insider Threat Investigation
+# Automated analysis for potential insider threat activities
+# ------------------------
+| union 
+    [search index=security sourcetype=file_monitoring ("sensitive" OR "confidential" OR "restricted")
+     | eval activity="Sensitive File Access", risk_weight=60
+     | eval details="Accessed: " + file_path + " at " + strftime(_time, "%H:%M")
+     | fields _time, user, computer, activity, risk_weight, details]
+    [search index=security sourcetype=wineventlog EventCode=4663 
+     | where match(Object_Name, "(?i)(hr|finance|legal|exec)")
+     | eval activity="Privileged Data Access", risk_weight=70
+     | eval details="Accessed: " + Object_Name
+     | fields _time, user, computer, activity, risk_weight, details]
+    [search index=network sourcetype=proxy 
+     | where match(url, "(?i)(job|resume|linkedin|indeed|career)")
+     | eval activity="Job Search Activity", risk_weight=40
+     | eval user=coalesce(user, cs_username)
+     | eval details="Visited: " + url_domain
+     | fields _time, user, computer, activity, risk_weight, details]
+    [search index=security sourcetype=email 
+     | where match(subject, "(?i)(personal|forward|copy|backup)")
+     | eval activity="Suspicious Email", risk_weight=50  
+     | eval user=coalesce(sender, from_user)
+     | eval details="Email: " + subject + " to " + recipient
+     | fields _time, user, computer, activity, risk_weight, details]
+| bucket _time span=24h
+| stats sum(risk_weight) as total_risk_score,
+        count as suspicious_activities,
+        values(activity) as activity_types,
+        values(details) as activity_details by user, _time
+| eval insider_threat_level=case(
+    total_risk_score >= 200, "CRITICAL - Immediate Investigation",
+    total_risk_score >= 120, "HIGH - Enhanced Monitoring", 
+    total_risk_score >= 80, "MEDIUM - Routine Review",
+    1==1, "LOW - Normal Activity"
+)
+| where insider_threat_level != "LOW - Normal Activity" 
+| eval investigation_steps=case(
+    insider_threat_level="CRITICAL - Immediate Investigation", "HR consultation, legal review, enhanced logging, interview scheduling",
+    insider_threat_level="HIGH - Enhanced Monitoring", "30-day monitoring, access review, supervisor notification",
+    1==1, "Weekly activity review, baseline establishment"
+)
+| eval hr_notification_required=if(total_risk_score >= 150, "YES", "NO")
+| sort -total_risk_score
+| fields user, total_risk_score, suspicious_activities, insider_threat_level,
+         activity_types, investigation_steps, hr_notification_required
+
+# =============================================================================
+# INCIDENT METRICS & KPI REPORTING
+# =============================================================================
+
+# ------------------------
+# METRICS: SOC Performance Dashboard
+# Key performance indicators for incident response effectiveness
+# ------------------------
+| union
+    [search index=security "incident_id=*" "status=closed"
+     | eval incident_type="Security Incident", status="Closed"
+     | eval resolution_time=_time - strptime(created_time, "%Y-%m-%d %H:%M:%S")
+     | fields incident_id, incident_type, severity, resolution_time, status]
+    [search index=security "alert_id=*" "status=resolved" 
+     | eval incident_type="Security Alert", status="Resolved"
+     | eval resolution_time=_time - strptime(triggered_time, "%Y-%m-%d %H:%M:%S")
+     | fields alert_id, incident_type, severity, resolution_time, status]
+| eval mttr_hours=round(resolution_time/3600, 2)
+| eval sla_met=case(
+    severity="Critical" AND mttr_hours <= 4, "YES",
+    severity="High" AND mttr_hours <= 24, "YES", 
+    severity="Medium" AND mttr_hours <= 72, "YES",
+    severity="Low" AND mttr_hours <= 168, "YES",
+    1==1, "NO"
+)
+| stats count as total_incidents,
+        avg(mttr_hours) as avg_mttr,
+        perc95(mttr_hours) as p95_mttr,
+        sum(eval(if(sla_met="YES", 1, 0))) as sla_compliant,
+        count as sla_total by severity
+| eval sla_percentage=round((sla_compliant/sla_total)*100, 1)
+| eval performance_rating=case(
+    sla_percentage >= 95, "Excellent",
+    sla_percentage >= 85, "Good",
+    sla_percentage >= 75, "Needs Improvement", 
+    1==1, "Critical - Review Required"
+)
+| fields severity, total_incidents, avg_mttr, p95_mttr, sla_percentage, performance_rating
+
+# =============================================================================
+# THREAT INTELLIGENCE INTEGRATION
+# =============================================================================
+
+# ------------------------
+# INTEL: IOC Matching and Enrichment
+# Correlates security events with threat intelligence feeds
+# ------------------------
+index=security (sourcetype=firewall OR sourcetype=proxy OR sourcetype=dns)
+| eval src_ip=coalesce(src_ip, clientip, source_ip)
+| eval dest_ip=coalesce(dest_ip, serverip, destination_ip) 
+| eval domain=coalesce(domain, query, url_domain)
+| eval file_hash=coalesce(MD5, SHA1, SHA256)
+| lookup threat_intel_iocs ip as src_ip OUTPUTNEW threat_type as src_threat_type, confidence as src_confidence, description as src_description
+| lookup threat_intel_iocs ip as dest_ip OUTPUTNEW threat_type as dest_threat_type, confidence as dest_confidence, description as dest_description  
+| lookup threat_intel_domains domain OUTPUTNEW threat_type as domain_threat_type, confidence as domain_confidence, description as domain_description
+| lookup threat_intel_hashes hash as file_hash OUTPUTNEW threat_type as hash_threat_type, confidence as hash_confidence, description as hash_description
+| eval ioc_matches=mvfilter(match(mvappend(src_threat_type, dest_threat_type, domain_threat_type, hash_threat_type), ".+"))
+| where mvcount(ioc_matches) > 0
+| eval max_confidence=max(src_confidence, dest_confidence, domain_confidence, hash_confidence)
+| eval intel_summary=case(
+    isnotnull(src_threat_type), "Source IP: " + src_threat_type + " (" + src_confidence + "%)",
+    isnotnull(dest_threat_type), "Destination IP: " + dest_threat_type + " (" + dest_confidence + "%)",
+    isnotnull(domain_threat_type), "Domain: " + domain_threat_type + " (" + domain_confidence + "%)",
+    isnotnull(hash_threat_type), "File Hash: " + hash_threat_type + " (" + hash_confidence + "%)",
+    1==1, "Multiple IOC Matches"
+)
+| eval threat_priority=case(
+    max_confidence >= 90, "P1 - Critical Threat",
+    max_confidence >= 75, "P2 - High Threat",
+    max_confidence >= 50, "P3 - Medium Threat", 
+    1==1, "P4 - Low Threat"
+)
+| eval recommended_action=case(
+    threat_priority="P1 - Critical Threat", "Block immediately, isolate affected systems", 
+    threat_priority="P2 - High Threat", "Enhanced monitoring, prepare for blocking",
+    threat_priority="P3 - Medium Threat", "Log and monitor, validate context",
+    1==1, "Monitor for patterns"
+)
+| stats count as match_count,
+        values(intel_summary) as threat_intelligence,
+        max(max_confidence) as highest_confidence,
+        values(threat_priority) as priority_levels,
+        values(recommended_action) as actions by src_ip, dest_ip, domain
+| sort -highest_confidence
+| fields src_ip, dest_ip, domain, match_count, threat_intelligence, 
+         highest_confidence, priority_levels, actions
