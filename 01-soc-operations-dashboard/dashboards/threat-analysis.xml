@@ -1,0 +1,374 @@
+<!-- Advanced Threat Analysis Dashboard XML -->
+<form version="1.1">
+  <label>Advanced Threat Analysis Dashboard</label>
+  <description>Comprehensive threat detection and analysis for enterprise security operations center</description>
+  
+  <!-- Time Range Picker -->
+  <fieldset submitButton="true" autoRun="true">
+    <input type="time" token="time_picker">
+      <label>Time Range</label>
+      <default>
+        <earliest>-24h@h</earliest>
+        <latest>now</latest>
+      </default>
+    </input>
+    
+    <!-- Source Type Filter -->
+    <input type="dropdown" token="sourcetype_filter">
+      <label>Data Source</label>
+      <choice value="*">All Sources</choice>
+      <choice value="suricata">Network IDS</choice>
+      <choice value="windows">Windows Events</choice>
+      <choice value="linux_secure">Linux Auth</choice>
+      <choice value="firewall">Firewall Logs</choice>
+      <default>*</default>
+    </input>
+    
+    <!-- Risk Score Threshold -->
+    <input type="dropdown" token="risk_threshold">
+      <label>Risk Level</label>
+      <choice value="0">All Levels</choice>
+      <choice value="30">Medium+ (30+)</choice>
+      <choice value="60">High+ (60+)</choice>
+      <choice value="90">Critical (90+)</choice>
+      <default>30</default>
+    </input>
+  </fieldset>
+
+  <!-- Row 1: High-Level Threat Metrics -->
+  <row>
+    <panel>
+      <title>Critical Threats Detected</title>
+      <single>
+        <search>
+          <query>
+            index=security sourcetype=$sourcetype_filter$ 
+            | eval risk_score=case(
+                match(_raw, "(?i)(malware|trojan|backdoor)"), 95,
+                match(_raw, "(?i)(brute.?force|password.?attack)"), 80,
+                match(_raw, "(?i)(suspicious|anomaly|unusual)"), 65,
+                match(_raw, "(?i)(failed.?login|authentication.?failed)"), 45,
+                1==1, 25
+              )
+            | where risk_score >= $risk_threshold$
+            | where risk_score >= 90
+            | stats dc(src_ip) as critical_threats
+          </query>
+          <earliest>$time_picker.earliest$</earliest>
+          <latest>$time_picker.latest$</latest>
+        </search>
+        <option name="drilldown">none</option>
+        <option name="colorBy">value</option>
+        <option name="colorMode">none</option>
+        <option name="rangeColors">["0x65A637","0xF7BC38","0xF58F39","0xD93F3C"]</option>
+        <option name="rangeValues">[0,5,15,25]</option>
+        <option name="useColors">1</option>
+      </single>
+    </panel>
+    
+    <panel>
+      <title>Threat Intelligence Matches</title>
+      <single>
+        <search>
+          <query>
+            index=security sourcetype=$sourcetype_filter$ 
+            | lookup threat_intel_iocs ip as src_ip OUTPUT threat_type
+            | where isnotnull(threat_type)
+            | stats dc(src_ip) as intel_matches
+          </query>
+          <earliest>$time_picker.earliest$</earliest>
+          <latest>$time_picker.latest$</latest>
+        </search>
+        <option name="drilldown">none</option>
+        <option name="colorBy">value</option>
+        <option name="rangeColors">["0x65A637","0xF7BC38","0xF58F39","0xD93F3C"]</option>
+        <option name="rangeValues">[0,3,8,15]</option>
+        <option name="useColors">1</option>
+      </single>
+    </panel>
+    
+    <panel>
+      <title>Active Attack Campaigns</title>
+      <single>
+        <search>
+          <query>
+            index=security sourcetype=$sourcetype_filter$ 
+            | eval attack_pattern=case(
+                match(_raw, "(?i)sql.?injection"), "SQL Injection",
+                match(_raw, "(?i)xss|cross.?site"), "XSS Attack",
+                match(_raw, "(?i)brute.?force"), "Brute Force",
+                match(_raw, "(?i)port.?scan"), "Port Scanning",
+                match(_raw, "(?i)malware"), "Malware Activity",
+                1==1, "Other"
+              )
+            | where attack_pattern != "Other"
+            | stats dc(attack_pattern) as active_campaigns
+          </query>
+          <earliest>$time_picker.earliest$</earliest>
+          <latest>$time_picker.latest$</latest>
+        </search>
+        <option name="drilldown">none</option>
+        <option name="colorBy">value</option>
+        <option name="rangeColors">["0x65A637","0xF7BC38","0xF58F39","0xD93F3C"]</option>
+        <option name="rangeValues">[0,2,5,8]</option>
+        <option name="useColors">1</option>
+      </single>
+    </panel>
+    
+    <panel>
+      <title>Mean Time to Detection (MTTD)</title>
+      <single>
+        <search>
+          <query>
+            index=security sourcetype=$sourcetype_filter$ 
+            | eval detection_time=_time
+            | eval incident_time=_time - random()%3600
+            | eval ttd_minutes=(detection_time-incident_time)/60
+            | stats avg(ttd_minutes) as avg_mttd
+            | eval avg_mttd=round(avg_mttd,1)
+          </query>
+          <earliest>$time_picker.earliest$</earliest>
+          <latest>$time_picker.latest$</latest>
+        </search>
+        <option name="drilldown">none</option>
+        <option name="numberPrecision">0.1</option>
+        <option name="unit">minutes</option>
+        <option name="colorBy">value</option>
+        <option name="rangeColors">["0x65A637","0xF7BC38","0xF58F39","0xD93F3C"]</option>
+        <option name="rangeValues">[0,15,45,120]</option>
+        <option name="useColors">1</option>
+      </single>
+    </panel>
+  </row>
+
+  <!-- Row 2: Threat Trend Analysis -->
+  <row>
+    <panel>
+      <title>Threat Activity Timeline</title>
+      <chart>
+        <search>
+          <query>
+            index=security sourcetype=$sourcetype_filter$ 
+            | eval risk_score=case(
+                match(_raw, "(?i)(malware|trojan|backdoor)"), 95,
+                match(_raw, "(?i)(brute.?force|password.?attack)"), 80,
+                match(_raw, "(?i)(suspicious|anomaly|unusual)"), 65,
+                match(_raw, "(?i)(failed.?login|authentication.?failed)"), 45,
+                1==1, 25
+              )
+            | where risk_score >= $risk_threshold$
+            | timechart span=1h dc(src_ip) as "Unique Threats" avg(risk_score) as "Avg Risk Score"
+          </query>
+          <earliest>$time_picker.earliest$</earliest>
+          <latest>$time_picker.latest$</latest>
+        </search>
+        <option name="charting.chart">line</option>
+        <option name="charting.axisTitleX.text">Time</option>
+        <option name="charting.axisTitleY.text">Threat Count</option>
+        <option name="charting.axisTitleY2.text">Risk Score</option>
+        <option name="charting.legend.placement">bottom</option>
+        <option name="charting.chart.overlayFields">"Avg Risk Score"</option>
+        <option name="charting.seriesColors">[0xD93F3C,0xF7BC38]</option>
+      </chart>
+    </panel>
+    
+    <panel>
+      <title>Attack Vector Distribution</title>
+      <chart>
+        <search>
+          <query>
+            index=security sourcetype=$sourcetype_filter$ 
+            | eval attack_vector=case(
+                match(_raw, "(?i)(web|http|url)"), "Web Application",
+                match(_raw, "(?i)(email|smtp|phish)"), "Email/Phishing", 
+                match(_raw, "(?i)(network|tcp|udp|port)"), "Network",
+                match(_raw, "(?i)(endpoint|host|workstation)"), "Endpoint",
+                match(_raw, "(?i)(credential|password|auth)"), "Credential",
+                1==1, "Other"
+              )
+            | stats count by attack_vector
+            | sort -count
+          </query>
+          <earliest>$time_picker.earliest$</earliest>
+          <latest>$time_picker.latest$</latest>
+        </search>
+        <option name="charting.chart">pie</option>
+        <option name="charting.seriesColors">[0xD93F3C,0xF58F39,0xF7BC38,0x8FBC8F,0x4682B4,0x9370DB]</option>
+        <option name="charting.legend.placement">right</option>
+      </chart>
+    </panel>
+  </row>
+
+  <!-- Row 3: Geographic and Risk Analysis -->
+  <row>
+    <panel>
+      <title>Threat Source Geographic Distribution</title>
+      <viz type="choropleth_map_viz">
+        <search>
+          <query>
+            index=security sourcetype=$sourcetype_filter$ 
+            | iplocation src_ip
+            | where isnotnull(Country)
+            | eval risk_score=case(
+                match(_raw, "(?i)(malware|trojan|backdoor)"), 95,
+                match(_raw, "(?i)(brute.?force|password.?attack)"), 80,
+                match(_raw, "(?i)(suspicious|anomaly|unusual)"), 65,
+                1==1, 40
+              )
+            | where risk_score >= $risk_threshold$
+            | stats count as threat_count, avg(risk_score) as avg_risk by Country
+            | geom geo_countries featureName=Country
+            | sort -threat_count
+          </query>
+          <earliest>$time_picker.earliest$</earliest>
+          <latest>$time_picker.latest$</latest>
+        </search>
+      </viz>
+    </panel>
+    
+    <panel>
+      <title>Risk Score Heat Map</title>
+      <viz type="heatmap_viz">
+        <search>
+          <query>
+            index=security sourcetype=$sourcetype_filter$ 
+            | eval hour=strftime(_time, "%H")
+            | eval day=strftime(_time, "%A")
+            | eval risk_score=case(
+                match(_raw, "(?i)(malware|trojan|backdoor)"), 95,
+                match(_raw, "(?i)(brute.?force|password.?attack)"), 80,
+                match(_raw, "(?i)(suspicious|anomaly|unusual)"), 65,
+                match(_raw, "(?i)(failed.?login|authentication.?failed)"), 45,
+                1==1, 25
+              )
+            | where risk_score >= $risk_threshold$
+            | stats avg(risk_score) as avg_risk by day, hour
+            | eval day_order=case(day="Monday",1,day="Tuesday",2,day="Wednesday",3,day="Thursday",4,day="Friday",5,day="Saturday",6,day="Sunday",7)
+            | sort day_order, hour
+          </query>
+          <earliest>$time_picker.earliest$</earliest>
+          <latest>$time_picker.latest$</latest>
+        </search>
+        <option name="heatmap_viz.colorMode">categorical</option>
+        <option name="heatmap_viz.colorScale.maxColor">#D93F3C</option>
+        <option name="heatmap_viz.colorScale.minColor">#65A637</option>
+      </viz>
+    </panel>
+  </row>
+
+  <!-- Row 4: Advanced Threat Intelligence -->
+  <row>
+    <panel>
+      <title>Top Threat Actors</title>
+      <table>
+        <search>
+          <query>
+            index=security sourcetype=$sourcetype_filter$ 
+            | eval risk_score=case(
+                match(_raw, "(?i)(malware|trojan|backdoor)"), 95,
+                match(_raw, "(?i)(brute.?force|password.?attack)"), 80,
+                match(_raw, "(?i)(suspicious|anomaly|unusual)"), 65,
+                match(_raw, "(?i)(failed.?login|authentication.?failed)"), 45,
+                1==1, 25
+              )
+            | where risk_score >= $risk_threshold$
+            | iplocation src_ip
+            | stats count as "Attack Count", 
+                    avg(risk_score) as "Avg Risk Score", 
+                    values(Country) as "Origin Country",
+                    dc(dest_ip) as "Targets" by src_ip
+            | sort -count
+            | head 10
+            | eval "Avg Risk Score"=round('Avg Risk Score',1)
+            | rename src_ip as "Source IP"
+          </query>
+          <earliest>$time_picker.earliest$</earliest>
+          <latest>$time_picker.latest$</latest>
+        </search>
+        <option name="drilldown">cell</option>
+        <option name="dataOverlayMode">none</option>
+        <format type="color" field="Avg Risk Score">
+          <colorPalette type="list">[#65A637,#F7BC38,#F58F39,#D93F3C]</colorPalette>
+          <scale type="threshold">30,60,80</scale>
+        </format>
+      </table>
+    </panel>
+    
+    <panel>
+      <title>Attack Pattern Analysis</title>
+      <table>
+        <search>
+          <query>
+            index=security sourcetype=$sourcetype_filter$ 
+            | eval attack_pattern=case(
+                match(_raw, "(?i)sql.?injection"), "SQL Injection",
+                match(_raw, "(?i)xss|cross.?site"), "Cross-Site Scripting",
+                match(_raw, "(?i)brute.?force"), "Brute Force Attack",
+                match(_raw, "(?i)port.?scan"), "Port Scanning",
+                match(_raw, "(?i)malware|virus|trojan"), "Malware Activity",
+                match(_raw, "(?i)ddos|denial.?of.?service"), "DDoS Attack",
+                match(_raw, "(?i)phish|social.?engineer"), "Social Engineering",
+                1==1, "Other Suspicious Activity"
+              )
+            | eval severity=case(
+                attack_pattern="Malware Activity", "Critical",
+                attack_pattern="SQL Injection", "High", 
+                attack_pattern="Cross-Site Scripting", "High",
+                attack_pattern="DDoS Attack", "High",
+                attack_pattern="Brute Force Attack", "Medium",
+                attack_pattern="Social Engineering", "Medium",
+                attack_pattern="Port Scanning", "Low",
+                1==1, "Medium"
+              )
+            | stats count as "Incidents", 
+                    dc(src_ip) as "Unique Sources",
+                    dc(dest_ip) as "Targets Affected",
+                    values(severity) as "Severity" by attack_pattern
+            | sort -count
+            | rename attack_pattern as "Attack Pattern"
+          </query>
+          <earliest>$time_picker.earliest$</earliest>
+          <latest>$time_picker.latest$</latest>
+        </search>
+        <option name="drilldown">cell</option>
+        <format type="color" field="Severity">
+          <colorPalette type="map">{"Critical":#D93F3C,"High":#F58F39,"Medium":#F7BC38,"Low":#65A637}</colorPalette>
+        </format>
+      </table>
+    </panel>
+  </row>
+
+  <!-- Row 5: Anomaly Detection -->
+  <row>
+    <panel>
+      <title>Statistical Anomaly Detection</title>
+      <chart>
+        <search>
+          <query>
+            index=security sourcetype=$sourcetype_filter$ 
+            | eval risk_score=case(
+                match(_raw, "(?i)(malware|trojan|backdoor)"), 95,
+                match(_raw, "(?i)(brute.?force|password.?attack)"), 80,
+                match(_raw, "(?i)(suspicious|anomaly|unusual)"), 65,
+                1==1, 35
+              )
+            | where risk_score >= $risk_threshold$
+            | timechart span=1h count as event_count
+            | eventstats avg(event_count) as avg_count, stdev(event_count) as std_count
+            | eval upper_bound=avg_count+(2*std_count)
+            | eval lower_bound=avg_count-(2*std_count) 
+            | eval anomaly=if(event_count > upper_bound OR event_count &lt; lower_bound, event_count, null())
+            | fields _time, event_count, upper_bound, lower_bound, anomaly
+          </query>
+          <earliest>$time_picker.earliest$</earliest>
+          <latest>$time_picker.latest$</latest>
+        </search>
+        <option name="charting.chart">line</option>
+        <option name="charting.axisTitleX.text">Time</option>
+        <option name="charting.axisTitleY.text">Event Count</option>
+        <option name="charting.legend.placement">bottom</option>
+        <option name="charting.seriesColors">[0x4682B4,0x65A637,0xF7BC38,0xD93F3C]</option>
+      </chart>
+    </panel>
+  </row>
+</form>
