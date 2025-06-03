@@ -1,0 +1,355 @@
+# =============================================================================
+# SECURITY ALERTS - PRODUCTION SPL SEARCHES
+# Author: Abayomi A. - Certified Splunk Power User & Enterprise Admin
+# Purpose: Enterprise-grade security alert searches for SOC operations
+# Last Updated: June 2025
+# =============================================================================
+
+# =============================================================================
+# CRITICAL SECURITY ALERTS
+# =============================================================================
+
+# ------------------------
+# ALERT: Multiple Failed Login Attempts (Brute Force Detection)
+# Triggers: 5+ failed attempts from same source in 5 minutes
+# ------------------------
+index=security (sourcetype=linux_secure OR sourcetype=wineventlog) 
+    (("authentication failure" OR "failed password" OR EventCode=4625) 
+    AND NOT ("service account" OR "system account"))
+| eval src_ip=coalesce(src_ip, src, clientip, remote_addr)
+| eval dest_host=coalesce(dest_host, dest, Computer, host)
+| eval user=coalesce(user, Account_Name, username, logname)
+| where isnotnull(src_ip) AND isnotnull(user)
+| bucket _time span=5m
+| stats count as failed_attempts, 
+        values(user) as attempted_users, 
+        values(dest_host) as target_hosts,
+        earliest(_time) as first_attempt,
+        latest(_time) as last_attempt by src_ip, _time
+| where failed_attempts >= 5
+| eval duration_minutes=round((last_attempt-first_attempt)/60,2)
+| eval alert_severity=case(
+    failed_attempts >= 20, "CRITICAL",
+    failed_attempts >= 10, "HIGH", 
+    failed_attempts >= 5, "MEDIUM"
+)
+| sort -failed_attempts
+| fields src_ip, failed_attempts, attempted_users, target_hosts, 
+         duration_minutes, alert_severity, first_attempt, last_attempt
+
+# ------------------------
+# ALERT: Suspicious Network Traffic Patterns
+# Triggers: Unusual port activity or data exfiltration indicators
+# ------------------------
+index=network sourcetype=firewall 
+| eval bytes_out=coalesce(bytes_out, sent_bytes, tx_bytes)
+| eval bytes_in=coalesce(bytes_in, received_bytes, rx_bytes) 
+| eval src_ip=coalesce(src_ip, src, source_ip)
+| eval dest_port=coalesce(dest_port, dport, destination_port)
+| where isnotnull(bytes_out) AND bytes_out > 0
+| bucket _time span=10m
+| stats sum(bytes_out) as total_bytes_out,
+        sum(bytes_in) as total_bytes_in,
+        dc(dest_port) as unique_ports,
+        values(dest_port) as ports_accessed,
+        count as connection_count by src_ip, _time
+| eval mb_transferred=round(total_bytes_out/1024/1024,2)
+| eval data_exfil_risk=case(
+    mb_transferred >= 500 AND unique_ports <= 3, "HIGH",
+    mb_transferred >= 100 AND unique_ports <= 5, "MEDIUM",
+    mb_transferred >= 50, "LOW",
+    1==1, "NONE"
+)
+| where data_exfil_risk != "NONE"
+| eval suspicious_ports=if(match(ports_accessed, "(22|23|135|139|445|1433|3389)"), "YES", "NO")
+| sort -mb_transferred
+| fields src_ip, mb_transferred, unique_ports, connection_count, 
+         data_exfil_risk, suspicious_ports, ports_accessed
+
+# ------------------------
+# ALERT: Malware Detection and Command & Control Communication
+# Triggers: Known malware signatures or C2 communication patterns
+# ------------------------
+index=security (sourcetype=suricata OR sourcetype=snort OR sourcetype=av_logs)
+| eval alert_signature=coalesce(signature, alert_signature, rule_name, threat_name)
+| eval src_ip=coalesce(src_ip, source_ip, client_ip)
+| eval dest_ip=coalesce(dest_ip, destination_ip, server_ip)
+| where match(alert_signature, "(?i)(malware|trojan|backdoor|botnet|c2|command.control|rat|rootkit)")
+| eval malware_family=case(
+    match(alert_signature, "(?i)emotet"), "Emotet",
+    match(alert_signature, "(?i)trickbot"), "TrickBot", 
+    match(alert_signature, "(?i)cobalt.strike"), "Cobalt Strike",
+    match(alert_signature, "(?i)mimikatz"), "Mimikatz",
+    match(alert_signature, "(?i)powershell"), "PowerShell Malware",
+    match(alert_signature, "(?i)(beacon|c2)"), "C2 Communication",
+    1==1, "Generic Malware"
+)
+| eval severity=case(
+    match(alert_signature, "(?i)(critical|high)"), "CRITICAL",
+    match(alert_signature, "(?i)(medium|moderate)"), "HIGH",
+    1==1, "MEDIUM"
+)
+| stats count as alert_count,
+        values(dest_ip) as contacted_ips,
+        values(malware_family) as malware_types,
+        earliest(_time) as first_seen,
+        latest(_time) as last_seen by src_ip, severity
+| eval infection_duration=round((last_seen-first_seen)/3600,2)
+| where alert_count >= 1
+| sort -alert_count
+| fields src_ip, alert_count, malware_types, contacted_ips, 
+         severity, infection_duration, first_seen, last_seen
+
+# =============================================================================
+# HIGH PRIORITY SECURITY ALERTS  
+# =============================================================================
+
+# ------------------------
+# ALERT: Privilege Escalation Attempts
+# Triggers: Unauthorized privilege changes or admin access attempts
+# ------------------------
+index=security (sourcetype=wineventlog OR sourcetype=linux_secure)
+    ((EventCode=4672 OR EventCode=4673 OR EventCode=4728 OR EventCode=4732) 
+    OR ("sudo" AND ("COMMAND" OR "incorrect password")))
+| eval user=coalesce(user, Account_Name, username, User_Name)
+| eval privilege_action=case(
+    EventCode=4672, "Admin Rights Assigned",
+    EventCode=4673, "Privileged Service Access", 
+    EventCode=4728, "User Added to Security Group",
+    EventCode=4732, "User Added to Local Group",
+    match(_raw, "sudo.*COMMAND"), "Sudo Command Executed",
+    match(_raw, "sudo.*incorrect"), "Sudo Authentication Failed",
+    1==1, "Unknown Privilege Activity"
+)
+| eval risk_level=case(
+    match(_raw, "(?i)(administrator|root|domain.admin)"), "CRITICAL",
+    match(_raw, "(?i)(backup.operator|server.operator)"), "HIGH",
+    match(_raw, "(?i)(power.user|guest)"), "MEDIUM",
+    1==1, "LOW"
+)
+| bucket _time span=1h
+| stats count as privilege_events,
+        values(privilege_action) as actions_taken,
+        dc(Computer) as affected_systems by user, risk_level, _time
+| where privilege_events >= 1 AND risk_level != "LOW"
+| sort -privilege_events
+| fields user, privilege_events, actions_taken, affected_systems, risk_level
+
+# ------------------------
+# ALERT: Data Access Anomalies
+# Triggers: Unusual file access patterns or sensitive data queries
+# ------------------------  
+index=security (sourcetype=windows OR sourcetype=database OR sourcetype=file_monitoring)
+    (("Object Access" AND "Special privileges assigned") 
+    OR ("SELECT" AND ("password" OR "ssn" OR "credit" OR "personal"))
+    OR ("file access" AND ("confidential" OR "restricted" OR "sensitive")))
+| eval user=coalesce(user, username, User_Name, account)
+| eval resource_accessed=coalesce(Object_Name, file_path, table_name, resource)
+| eval access_type=case(
+    match(_raw, "(?i)file.*access"), "File System",
+    match(_raw, "(?i)database|select|query"), "Database", 
+    match(_raw, "(?i)registry"), "Registry",
+    match(_raw, "(?i)network.*share"), "Network Share",
+    1==1, "Other"
+)
+| eval sensitivity_level=case(
+    match(resource_accessed, "(?i)(password|credential|secret)"), "CRITICAL",
+    match(resource_accessed, "(?i)(ssn|social.*security|credit.*card)"), "CRITICAL", 
+    match(resource_accessed, "(?i)(personal|confidential|restricted)"), "HIGH",
+    match(resource_accessed, "(?i)(finance|payroll|hr)"), "HIGH",
+    1==1, "MEDIUM"
+)
+| bucket _time span=30m  
+| stats count as access_count,
+        dc(resource_accessed) as unique_resources,
+        values(access_type) as access_methods,
+        values(resource_accessed) as resources by user, sensitivity_level, _time
+| where access_count >= 3 AND sensitivity_level IN ("CRITICAL","HIGH")
+| sort -access_count
+| fields user, access_count, unique_resources, access_methods, 
+         sensitivity_level, resources
+
+# ------------------------
+# ALERT: Suspicious PowerShell Activity  
+# Triggers: Encoded commands, download attempts, or malicious PowerShell usage
+# ------------------------
+index=security sourcetype=wineventlog EventCode=4103 OR EventCode=4104
+| eval powershell_command=coalesce(ScriptBlockText, Message, CommandLine)
+| where match(powershell_command, "(?i)(encodedcommand|downloadstring|invoke-expression|iex|bypass|hidden|noprofile)")
+| eval threat_indicators=case(
+    match(powershell_command, "(?i)encodedcommand.*[A-Za-z0-9+/=]{50,}"), "Base64 Encoded Command",
+    match(powershell_command, "(?i)downloadstring.*http"), "Web Download Attempt", 
+    match(powershell_command, "(?i)invoke-expression|iex"), "Dynamic Code Execution",
+    match(powershell_command, "(?i)bypass.*executionpolicy"), "Execution Policy Bypass",
+    match(powershell_command, "(?i)hidden.*windowstyle"), "Hidden Window Execution",
+    match(powershell_command, "(?i)noprofile.*noninteractive"), "Non-Interactive Execution",
+    1==1, "Suspicious PowerShell Activity"
+)
+| eval risk_score=case(
+    match(powershell_command, "(?i)(mimikatz|invoke-mimikatz)"), 95,
+    match(powershell_command, "(?i)(empire|meterpreter|cobalt)"), 90,
+    match(powershell_command, "(?i)downloadstring.*exe"), 85,
+    match(powershell_command, "(?i)encodedcommand"), 75,
+    match(powershell_command, "(?i)bypass"), 65,
+    1==1, 50
+)
+| eval user=coalesce(User, username, account)
+| eval computer=coalesce(Computer, ComputerName, host)
+| where risk_score >= 65
+| stats count as ps_events,
+        max(risk_score) as max_risk,
+        values(threat_indicators) as indicators,
+        values(powershell_command) as commands by user, computer
+| sort -max_risk
+| fields user, computer, ps_events, max_risk, indicators, commands
+
+# =============================================================================
+# MEDIUM PRIORITY SECURITY ALERTS
+# =============================================================================
+
+# ------------------------
+# ALERT: Unusual Login Times and Locations
+# Triggers: Off-hours access or geographically impossible logins  
+# ------------------------
+index=security (sourcetype=wineventlog EventCode=4624) OR (sourcetype=linux_secure "Accepted")
+| eval user=coalesce(user, Account_Name, username)
+| eval src_ip=coalesce(src_ip, IpAddress, client_ip)
+| eval login_hour=tonumber(strftime(_time, "%H"))
+| eval login_day=strftime(_time, "%A")
+| iplocation src_ip
+| eval business_hours=if((login_hour >= 8 AND login_hour <= 18) AND 
+                       (login_day != "Saturday" AND login_day != "Sunday"), "YES", "NO")
+| eval geographic_risk=case(
+    Country="Unknown" OR isnull(Country), "HIGH",
+    Country IN ("China","Russia","North Korea","Iran"), "HIGH", 
+    Country != "United States", "MEDIUM",
+    1==1, "LOW"
+)
+| where business_hours="NO" OR geographic_risk IN ("HIGH","MEDIUM")
+| stats count as login_attempts,
+        values(Country) as countries,
+        values(City) as cities, 
+        dc(src_ip) as unique_ips,
+        values(login_hour) as hours by user, geographic_risk
+| where login_attempts >= 1
+| sort -login_attempts  
+| fields user, login_attempts, countries, cities, unique_ips, 
+         hours, geographic_risk
+
+# ------------------------
+# ALERT: Failed Service Account Authentication
+# Triggers: Service account authentication failures indicating compromise
+# ------------------------
+index=security (sourcetype=wineventlog EventCode=4625) OR (sourcetype=linux_secure "authentication failure")
+| eval account=coalesce(Account_Name, user, username)
+| eval src_ip=coalecase(src_ip, IpAddress, client_ip) 
+| where match(account, "(?i)(service|svc|app|system|sql|oracle|apache|nginx)")
+| eval service_type=case(
+    match(account, "(?i)sql"), "Database Service",
+    match(account, "(?i)(apache|nginx|iis)"), "Web Service", 
+    match(account, "(?i)(exchange|mail)"), "Email Service",
+    match(account, "(?i)(backup|veeam)"), "Backup Service",
+    1==1, "Generic Service Account"
+)
+| bucket _time span=15m
+| stats count as failed_attempts,
+        values(src_ip) as source_ips,
+        dc(src_ip) as unique_sources by account, service_type, _time
+| where failed_attempts >= 3
+| eval alert_priority=case(
+    failed_attempts >= 10, "HIGH",
+    failed_attempts >= 5, "MEDIUM", 
+    1==1, "LOW"
+)
+| sort -failed_attempts
+| fields account, service_type, failed_attempts, source_ips, 
+         unique_sources, alert_priority
+
+# =============================================================================
+# CORRELATION SEARCHES FOR ADVANCED THREAT DETECTION
+# =============================================================================
+
+# ------------------------
+# CORRELATION: Multi-Stage Attack Detection
+# Correlates multiple attack phases: Recon -> Initial Access -> Persistence
+# ------------------------
+| union 
+    [search index=security sourcetype=firewall "port scan" 
+     | eval attack_stage="Reconnaissance" | fields _time, src_ip, attack_stage]
+    [search index=security (EventCode=4624 OR "ssh.*accepted") 
+     | eval attack_stage="Initial Access" 
+     | eval src_ip=coalesce(src_ip, IpAddress)
+     | fields _time, src_ip, attack_stage]
+    [search index=security (EventCode=4698 OR "crontab" OR "scheduled task") 
+     | eval attack_stage="Persistence" 
+     | eval src_ip=coalesce(src_ip, client_ip, remote_ip)
+     | fields _time, src_ip, attack_stage]
+| bucket _time span=1h  
+| stats values(attack_stage) as stages, 
+        count as total_events,
+        range(_time) as attack_duration by src_ip, _time
+| eval stage_count=mvcount(stages)
+| where stage_count >= 2
+| eval kill_chain_progress=case(
+    stage_count >= 3, "CRITICAL - Full Attack Chain",
+    match(stages, "Reconnaissance.*Initial Access"), "HIGH - Active Intrusion",
+    1==1, "MEDIUM - Suspicious Activity"
+)
+| sort -stage_count
+| fields src_ip, stages, stage_count, total_events, 
+         attack_duration, kill_chain_progress
+
+# =============================================================================
+# PERFORMANCE OPTIMIZED SEARCHES
+# These searches include optimization techniques for production environments
+# =============================================================================
+
+# ------------------------
+# OPTIMIZED: Real-time Security Event Monitoring
+# Uses summary indexing and statistical commands for performance
+# ------------------------  
+| tstats prestats=true count as event_count,
+         values(sourcetype) as sourcetypes,
+         dc(host) as affected_hosts
+  WHERE index=security 
+    AND (sourcetype=wineventlog OR sourcetype=linux_secure OR sourcetype=firewall)
+    AND _time >= relative_time(now(), "-1h@h")
+  BY _time span=5m, sourcetype
+| stats sum(event_count) as total_events,
+        values(sourcetypes) as data_sources,
+        sum(affected_hosts) as total_hosts by _time
+| eval baseline_events=50  
+| eval anomaly_threshold=baseline_events*3
+| eval event_anomaly=if(total_events > anomaly_threshold, "YES", "NO")
+| where event_anomaly="YES"
+| fields _time, total_events, data_sources, total_hosts, event_anomaly
+
+# =============================================================================
+# THREAT HUNTING QUERIES
+# Advanced searches for proactive threat detection
+# =============================================================================
+
+# ------------------------
+# HUNT: Living off the Land Techniques
+# Detects abuse of legitimate system tools for malicious purposes
+# ------------------------
+index=security (sourcetype=wineventlog EventCode=4688) OR (sourcetype=sysmon EventCode=1)
+| eval process=coalesce(Process_Name, Image, process_name)
+| eval command_line=coalesce(CommandLine, command, cmd)
+| where match(process, "(?i)(powershell|cmd|wmic|certutil|bitsadmin|regsvr32)")
+| eval lolbas_technique=case(
+    match(command_line, "(?i)certutil.*-urlcache.*-split"), "CertUtil File Download",
+    match(command_line, "(?i)bitsadmin.*transfer"), "BITS Transfer Abuse",
+    match(command_line, "(?i)wmic.*process.*call.*create"), "WMI Process Creation", 
+    match(command_line, "(?i)regsvr32.*\/s.*\/u.*\/i:http"), "Regsvr32 Bypass",
+    match(command_line, "(?i)powershell.*-enc.*-nop"), "PowerShell Obfuscation",
+    1==1, "Suspicious System Tool Usage"
+)
+| eval user=coalesce(user, User, account)
+| eval computer=coalesce(Computer, ComputerName, host)
+| stats count as usage_count,
+        values(lolbas_technique) as techniques,
+        values(command_line) as commands by user, computer  
+| where usage_count >= 1
+| sort -usage_count
+| fields user, computer, usage_count, techniques, commands
