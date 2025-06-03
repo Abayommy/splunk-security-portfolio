@@ -1,0 +1,25 @@
+<!-- SOC Overview Dashboard XML -->
+<form version="1.1">
+  <label>SOC Operations Overview</label>
+  <description>Real-time security operations center dashboard providing comprehensive threat visibility</description>
+  
+  <fieldset submitButton="false" autoRun="true">
+    <input type="time" token="time_picker">
+      <label>Time Range</label>
+      <default>
+        <earliest>-24h@h</earliest>
+        <latest>now</latest>
+      </default>
+    </input>
+  </fieldset>
+
+  <row>
+    <panel>
+      <title>Security Events Summary</title>
+      <single>
+        <search>
+          <query>
+            index=security earliest=$time_picker.earliest$ latest=$time_picker.latest$
+            | stats count as total_events
+            | eval total_events=tostring(total_events,"commas")
+          </query>
